@@ -1,7 +1,6 @@
 package container
 
 import (
-	"errors"
 	"os"
 	"strings"
 
@@ -20,59 +19,71 @@ import (
  * as available in that order
  */
 func EncodedAuth(ref string) (string, error) {
-	auth, err := EncodedEnvAuth(ref)
+	auth, err := firstValidAuth(ref, []authBackend{
+		authFromEnv(),
+		authFromDockerConfig(),
+	})
 	if err != nil {
-		auth, err = EncodedConfigAuth(ref)
-	}
-	return auth, err
-}
-
-/*
- * Return an encoded auth config for the given registry
- * loaded from environment variables
- * Returns an error if authentication environment variables have not been set
- */
-func EncodedEnvAuth(ref string) (string, error) {
-	username := os.Getenv("REPO_USER")
-	password := os.Getenv("REPO_PASS")
-	if username != "" && password != "" {
-		auth := types.AuthConfig{
-			Username: username,
-			Password: password,
-		}
 		log.Debugf("Loaded auth credentials %s for %s", auth, ref)
 		return EncodeAuth(auth)
-	} else {
-		return "", errors.New("Registry auth environment variables (REPO_USER, REPO_PASS) not set")
+	}
+	return "", err
+}
+
+// authBackend encapsulates a function that resolves registry credentials.
+type authBackend func(string) (*types.AuthConfig, error)
+
+// firstValidAuth tries a list of auth backends, returning first error or AuthConfig
+func firstValidAuth(repo string, backends []authBackend) (*types.AuthConfig, error) {
+	for _, backend := range backends {
+		auth, err := backend(repo)
+		if auth != nil || err != nil {
+			return auth, err
+		}
+	}
+	return nil, nil
+}
+
+// authFromEnv generates an authBackend via ENV variables
+func authFromEnv() authBackend {
+	return func(string) (*types.AuthConfig, error) {
+		username := os.Getenv("REPO_USER")
+		password := os.Getenv("REPO_PASS")
+		if username != "" && password != "" {
+			auth := types.AuthConfig{
+				Username: username,
+				Password: password,
+			}
+			return &auth, nil
+		} else {
+			return nil, nil
+		}
 	}
 }
 
-/*
- * Return an encoded auth config for the given registry
- * loaded from the docker config
- * Returns an empty string if credentials cannot be found for the referenced server
- * The docker config must be mounted on the container
- */
-func EncodedConfigAuth(ref string) (string, error) {
-	server, err := ParseServerAddress(ref)
-	configDir := os.Getenv("DOCKER_CONFIG")
-	if configDir == "" {
-		configDir = "/"
+// authFromDockerConfig parses a Docker configuration for auth information
+func authFromDockerConfig() authBackend {
+	return func(ref string) (*types.AuthConfig, error) {
+		server, err := ParseServerAddress(ref)
+		configDir := os.Getenv("DOCKER_CONFIG")
+		if configDir == "" {
+			configDir = "/"
+		}
+		configFile, err := cliconfig.Load(configDir)
+		if err != nil {
+			log.Errorf("Unable to find default config file %s", err)
+			return nil, err
+		}
+
+		credStore := CredentialsStore(*configFile, server)
+		auth, err := credStore.Get(server) // returns (types.AuthConfig{}) if server not in credStore
+		if auth == (types.AuthConfig{}) {
+			return nil, nil
+		}
+		return &auth, nil
 	}
-	configFile, err := cliconfig.Load(configDir)
-	if err != nil {
-		log.Errorf("Unable to find default config file %s", err)
-		return "", err
-	}
-	credStore := CredentialsStore(*configFile)
-	auth, err := credStore.Get(server) // returns (types.AuthConfig{}) if server not in credStore
-	if auth == (types.AuthConfig{}) {
-		log.Debugf("No credentials for %s in %s", server, configFile.Filename)
-		return "", nil
-	}
-	log.Debugf("Loaded auth credentials %s from %s", auth, configFile.Filename)
-	return EncodeAuth(auth)
 }
+
 
 func ParseServerAddress(ref string) (string, error) {
 	repository, _, err := reference.Parse(ref)
@@ -85,9 +96,13 @@ func ParseServerAddress(ref string) (string, error) {
 
 // CredentialsStore returns a new credentials store based
 // on the settings provided in the configuration file.
-func CredentialsStore(configFile configfile.ConfigFile) credentials.Store {
+func CredentialsStore(configFile configfile.ConfigFile, server string) credentials.Store {
 	if configFile.CredentialsStore != "" {
 		return credentials.NewNativeStore(&configFile, configFile.CredentialsStore)
+	}
+	helper, ok := configFile.CredentialHelpers[server]
+	if ok {
+		return credentials.NewNativeStore(&configFile, helper)
 	}
 	return credentials.NewFileStore(&configFile)
 }
@@ -95,8 +110,8 @@ func CredentialsStore(configFile configfile.ConfigFile) credentials.Store {
 /*
  * Base64 encode an AuthConfig struct for transmission over HTTP
  */
-func EncodeAuth(auth types.AuthConfig) (string, error) {
-	return command.EncodeAuthToBase64(auth)
+func EncodeAuth(auth *types.AuthConfig) (string, error) {
+	return command.EncodeAuthToBase64(*auth)
 }
 
 /**
